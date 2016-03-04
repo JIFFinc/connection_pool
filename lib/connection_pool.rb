@@ -36,6 +36,26 @@ class ConnectionPool
 
   class Error < RuntimeError
   end
+  class Recreate < Error
+  end
+
+  class ErrorHandler
+    attr_reader :error, :connection, :recreate, :retry
+    def initialize(error,connection)
+      @error = error
+      @connection = connection
+      @recreate = false
+      @retry = false
+    end
+
+    def recreate!
+      @recreate = true
+    end
+
+    def retry!
+      @retry = true
+    end
+  end
 
   def self.wrap(options, &block)
     Wrapper.new(options, &block)
@@ -48,6 +68,7 @@ class ConnectionPool
 
     @size = options.fetch(:size)
     @timeout = options.fetch(:timeout)
+    @rescue = options.fetch(:rescue, nil)
 
     @available = TimedStack.new(@size, &block)
     @key = :"current-#{@available.object_id}"
@@ -76,6 +97,19 @@ else
     conn = checkout(options)
     begin
       yield conn
+    rescue => e
+      if @rescue
+        handler = ErrorHandler.new(e, conn)
+        @rescue.call(handler)
+        if handler.recreate
+          recreate
+        end
+        if handler.retry
+          retry
+        else
+          raise e
+        end
+      end
     ensure
       checkin
     end
@@ -99,6 +133,15 @@ end
     conn = pop_connection # mutates stack, must be on its own line
     @available.push(conn) if stack.empty?
 
+    nil
+  end
+
+  def recreate
+    # clear stack and rebuild
+    size = stack.size
+    stack.clear
+    conn = @available.pop(timeout: @timeout)
+    stack.concat(Array(size, conn))
     nil
   end
 
