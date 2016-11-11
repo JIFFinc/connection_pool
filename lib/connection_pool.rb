@@ -28,11 +28,16 @@ require_relative 'connection_pool/timed_stack'
 #    end
 #
 # Accepts the following options:
-# - :size - number of connections to pool, defaults to 5
+# - :min - min number of connections to pool, defaults to 0
+# - :max - max of connections to pool, defaults to 5
+# - :size - overrides min/max and sets the min to 0 and max to this size
 # - :timeout - amount of time to wait for a connection if none currently available, defaults to 5 seconds
+# - :max_age - how long a connection is allow to remain active. Oldest connections are culled. If the connection pool
+# drops below the minimum then a new connection is created.
 #
+
 class ConnectionPool
-  DEFAULTS = {size: 5, timeout: 5}
+  DEFAULTS = {min: 0, max: 5, size: nil, timeout: 5, max_age: 3600}
 
   class Error < RuntimeError
   end
@@ -46,10 +51,16 @@ class ConnectionPool
 
     options = DEFAULTS.merge(options)
 
-    @size = options.fetch(:size)
+    @min = options.fetch(:min)
+    @max = options.fetch(:max)
+    if options.fetch(:size)
+      @min = 0
+      @max = options.fetch(:size)
+    end
     @timeout = options.fetch(:timeout)
+    @max_age = options.fetch(:max_age)
 
-    @available = TimedStack.new(@size, &block)
+    @available = TimedStack.new(min: @min, max: @max, max_age: @max_age, shutdown: options.fetch(:shutdown, nil), &block)
     @key = :"current-#{@available.object_id}"
   end
 
@@ -92,7 +103,7 @@ end
     end
 
     stack.push conn
-    conn
+    conn.connection
   end
 
   def checkin

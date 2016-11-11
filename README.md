@@ -72,9 +72,33 @@ Once you've ported your entire system to use `with`, you can simply remove
 `Wrapper` and use the simpler and faster `ConnectionPool`.
 
 
+## Min/Max
+
+An alternative to the `size` argument is to specify a `min` and a `max` pools size.
+The a `min: 0` and `max: 5` is equivalent to `size: 5`. Connections will never 
+reduce/shutdown unless you also specify `max_age`. Specifying a `min` will create
+that number of connections during initialization.
+
+``` ruby
+$memcached = ConnectionPool.new(min: 1, max: 5, max_age: 3600) { Dalli::Client.new }
+```
+
+## Stale Connections
+
+If you want to refresh connections periodically and scale down to the `min` pool size
+you can specify `max_age` (seconds). A `max_age` of 60 will prevent checkouts of 
+connections older than 60 seconds. A cleanup thread will run in the background and
+periodically shutdown stale connections. You can specify a `shutdown` block to run
+when a connection has expired to ensure proper cleanup of the connection object. The
+default `max_age` is 0 which will never expire connections.
+
+``` ruby
+cp = ConnectionPool.new(min: 1, max: 5, max_age: 3600, shutdown: lambda{|conn| conn.quit }) { Redis.new }
+```
+
 ## Shutdown
 
-You can shut down a ConnectionPool instance once it should no longer be used.
+You can manually shut down a ConnectionPool instance once it should no longer be used.
 Further checkout attempts will immediately raise an error but existing checkouts
 will work.
 
@@ -83,9 +107,13 @@ cp = ConnectionPool.new { Redis.new }
 cp.shutdown { |conn| conn.quit }
 ```
 
+The block passed in is optional, but if it is specified it will override the `shutdown` 
+block passed in during initialization.
+
 Shutting down a connection pool will block until all connections are checked in and closed.
 **Note that shutting down is completely optional**; Ruby's garbage collector will reclaim
 unreferenced pools under normal circumstances.
+
 
 
 Notes

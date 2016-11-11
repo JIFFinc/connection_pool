@@ -336,7 +336,7 @@ class TestConnectionPool < Minitest::Test
   end
 
   def test_reuses_objects_when_pool_not_saturated
-    pool = ConnectionPool.new(size: 5) { NetworkConnection.new }
+    pool = ConnectionPool.new(size: 1) { NetworkConnection.new }
 
     ids = 10.times.map do
       pool.with { |c| c.object_id }
@@ -419,14 +419,6 @@ class TestConnectionPool < Minitest::Test
     pool.checkin
 
     assert_equal [["shutdown"], ["shutdown"], ["shutdown"]], recorders.map { |r| r.calls }
-  end
-
-  def test_raises_an_error_if_shutdown_is_called_without_a_block
-    pool = ConnectionPool.new(size: 1) { }
-
-    assert_raises ArgumentError do
-      pool.shutdown
-    end
   end
 
   def test_shutdown_is_executed_for_all_connections_in_wrapped_pool

@@ -11,11 +11,11 @@ class ConnectionPool::PoolShuttingDownError < RuntimeError; end
 ##
 # The TimedStack manages a pool of homogeneous connections (or any resource
 # you wish to manage).  Connections are created lazily up to a given maximum
-# number.
+# number. Expired connections are shutdown automatically every 5 seconds.
 
 # Examples:
 #
-#    ts = TimedStack.new(1) { MyConnection.new }
+#    ts = TimedStack.new(min: 1, max: 1, max_age: 3600) { MyConnection.new }
 #
 #    # fetch a connection
 #    conn = ts.pop
@@ -29,18 +29,51 @@ class ConnectionPool::PoolShuttingDownError < RuntimeError; end
 
 class ConnectionPool::TimedStack
 
+  class Connection
+    attr_accessor :created_at, :connection
+    def initialize(connection, created_at: nil)
+      @created_at = created_at || Time.now
+      @connection = connection
+    end
+
+    def shutdown(&block)
+      block.call(connection) if block_given?
+    rescue
+      # the shutdown block should handle its own exceptions so it should be safe to ignore any uncaught exceptions
+    end
+  end
+
   ##
-  # Creates a new pool with +size+ connections that are created from the given
+  # Creates a new pool with +min+ connections that are created from the given
   # +block+.
 
-  def initialize(size = 0, &block)
+  def initialize(min: 0, max: 0, max_age: 0, shutdown: nil, cleanup_frequency: 5, &block)
+    raise ArgumentError, 'min is greater than max' if min > max
     @create_block = block
     @created = 0
     @que = []
-    @max = size
+    @min = min
+    @max = max
+    @max_age = max_age
     @mutex = Mutex.new
     @resource = ConditionVariable.new
-    @shutdown_block = nil
+    @shutdown_block = shutdown
+    @shutting_down = false
+    @cleanup_frequency = cleanup_frequency
+
+    @thread = nil
+    if @max_age > 0
+      @thread = Thread.new do
+        cleanup_loop
+      end
+      @thread.run
+    end
+
+    # setup min connections
+    @min.times do
+      conn = try_create()
+      store_connection(conn)
+    end
   end
 
   ##
@@ -49,8 +82,8 @@ class ConnectionPool::TimedStack
 
   def push(obj, options = {})
     @mutex.synchronize do
-      if @shutdown_block
-        @shutdown_block.call(obj)
+      if @shutting_down
+        obj.shutdown(&@shutdown_block)
       else
         store_connection obj, options
       end
@@ -76,10 +109,11 @@ class ConnectionPool::TimedStack
     deadline = ConnectionPool.monotonic_time + timeout
     @mutex.synchronize do
       loop do
-        raise ConnectionPool::PoolShuttingDownError if @shutdown_block
-        return fetch_connection(options) if connection_stored?(options)
+        raise ConnectionPool::PoolShuttingDownError if @shutting_down
+        # Connections may have expired so this may return nil
+        connection = fetch_connection(options) if connection_stored?(options)
 
-        connection = try_create(options)
+        connection ||= try_create(options)
         return connection if connection
 
         to_wait = deadline - ConnectionPool.monotonic_time
@@ -91,16 +125,27 @@ class ConnectionPool::TimedStack
 
   ##
   # Shuts down the TimedStack which prevents connections from being checked
-  # out.  The +block+ is called once for each connection on the stack.
+  # out.
 
-  def shutdown(&block)
-    raise ArgumentError, "shutdown must receive a block" unless block_given?
+  def shutdown(options={},&block)
+    @shutdown_block = block if block_given?
 
+    # prevent push, pop and stop the cleanup_loop
     @mutex.synchronize do
-      @shutdown_block = block
+      return if @shutting_down
+      @shutting_down = true
       @resource.broadcast
+    end
+    @thread.join if @thread
 
-      shutdown_connections
+    # finish shutting down connections
+    @mutex.synchronize do
+      while connection_stored?(options)
+        conn = fetch_connection(options)
+        if conn
+          conn.shutdown(&@shutdown_block)
+        end
+      end
     end
   end
 
@@ -132,21 +177,18 @@ class ConnectionPool::TimedStack
   ##
   # This is an extension point for TimedStack and is called with a mutex.
   #
-  # This method must return a connection from the stack.
+  # This method reaps expired connections and returns a valid connection from the stack.
+  # Returns nil when there are no more valid connections
 
   def fetch_connection(options = nil)
-    @que.pop
-  end
-
-  ##
-  # This is an extension point for TimedStack and is called with a mutex.
-  #
-  # This method must shut down all connections on the stack.
-
-  def shutdown_connections(options = nil)
-    while connection_stored?(options)
-      conn = fetch_connection(options)
-      @shutdown_block.call(conn)
+    while conn = @que.pop do
+      # check for expired connections
+      if @max_age > 0 && conn.created_at < Time.now - @max_age
+        @created -= 1
+        conn.shutdown(&@shutdown_block)
+      else
+        return conn
+      end
     end
   end
 
@@ -167,9 +209,40 @@ class ConnectionPool::TimedStack
 
   def try_create(options = nil)
     unless @created == @max
-      object = @create_block.call
+      object = Connection.new(@create_block.call)
       @created += 1
       object
     end
+  end
+
+  ##
+  # Cleans up expired connections periodically
+
+  def cleanup_loop
+    # Connections expire on their own when fetched. Periodically fetch connections to ensure they don't get stale.
+    # Over time this will clear out expired connections.
+    next_cleanup = Time.now + @cleanup_frequency
+    @mutex.synchronize do
+      while !@shutting_down do
+        time = Time.now
+        if time >= next_cleanup
+          conn = fetch_connection
+          if conn
+            store_connection(conn)
+          end
+
+          # ensure we have not dropped below the minimum
+          if @created < @min
+            store_connection(try_create)
+          end
+
+          next_cleanup = time + @cleanup_frequency
+        end
+
+        # This wait will return faster than we want, but that is desired so the thread can exit immediately during shutdown
+        @resource.wait(@mutex, next_cleanup - time)
+      end
+    end
+
   end
 end
